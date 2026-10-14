@@ -9,6 +9,7 @@ import android.location.LocationManager
 import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -48,6 +49,13 @@ class SettingsFragment : PreferenceFragmentCompat() {
                 requestGridLocation()
             } else {
                 showGridError(R.string.permission_location_denied)
+            }
+        }
+
+    private val bluetoothPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (!granted) {
+                view?.let { Snackbar.make(it, R.string.permission_bluetooth_denied, Snackbar.LENGTH_LONG).show() }
             }
         }
 
@@ -212,8 +220,14 @@ class SettingsFragment : PreferenceFragmentCompat() {
         }
         // Some rigs(e.g. TruSDX) replace the device list
         // The new val is stored after this returns so read it next pass
-        findPreference<ListPreference>("rig_type")?.setOnPreferenceChangeListener { _, _ ->
+        findPreference<ListPreference>("rig_type")?.setOnPreferenceChangeListener { _, newValue ->
             view?.post { updateAudioDeviceSummary() }
+            if (newValue == "btech_uvpro" && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.BLUETOOTH_CONNECT) !=
+                PackageManager.PERMISSION_GRANTED
+            ) {
+                bluetoothPermissionLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
+            }
             true
         }
 

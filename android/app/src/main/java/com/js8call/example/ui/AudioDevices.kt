@@ -23,7 +23,7 @@ object AudioDevices {
     /** True when rig audio arrives over the serial link instead of a microphone. */
     fun usesSerialAudio(context: Context): Boolean =
         PreferenceManager.getDefaultSharedPreferences(context)
-            .getString("rig_type", "none") == "trusdx_serial"
+            .getString("rig_type", "none") in setOf("trusdx_serial", "btech_uvpro")
 
     /** The display name for a capture device, or null for types not offered. */
     fun nameFor(device: AudioDeviceInfo): String? = when (device.type) {
@@ -42,10 +42,14 @@ object AudioDevices {
     /**
      * Inputs available right now, in the order they are offered.
      *
-     * A TruSDX rig replaces the list: its audio arrives over the serial link,
-     * so the phone's own inputs cannot carry it.
+     * A TruSDX or UV-Pro rig replaces the list: its audio arrives over the
+     * serial link, so the phone's own inputs cannot carry it.
      */
     fun list(context: Context): List<Device> {
+        val rigType = PreferenceManager.getDefaultSharedPreferences(context).getString("rig_type", "none")
+        if (rigType == "btech_uvpro") {
+            return listOf(Device(JS8EngineService.UVPRO_AUDIO_ID, JS8EngineService.UVPRO_AUDIO_NAME))
+        }
         if (usesSerialAudio(context)) {
             return listOf(
                 Device(JS8EngineService.TRUSDX_AUDIO_SERIAL_ID, JS8EngineService.TRUSDX_AUDIO_SERIAL_NAME),

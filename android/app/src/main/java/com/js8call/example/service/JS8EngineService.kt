@@ -88,6 +88,7 @@ class JS8EngineService : Service() {
     private var rtsPttConnected: Boolean = false
     private var trusdxConnected: Boolean = false
     private var qmxConnected: Boolean = false
+    private var uvproConnected: Boolean = false
     private var rtsPttTransport: SerialTransport? = null
     private var usbSerialBridge: UsbSerialBridge? = null
     private var bluetoothSerialBridge: BluetoothSerialBridge? = null
@@ -95,6 +96,7 @@ class JS8EngineService : Service() {
     private var trusdxSerialSession: TruSdxSerialSession? = null
     private var qmxDirectSerial: QmxDirectSerial? = null
     private var qmxCatSession: QmxCatSession? = null
+    private var uvProSession: UvProSession? = null
     @Volatile private var trusdxInitInProgress: Boolean = false
     @Volatile private var engineStartGeneration: Int = 0
     @Volatile private var engineStartInProgress: Boolean = false
@@ -499,7 +501,24 @@ class JS8EngineService : Service() {
                 }
             })
         }
+        uvProSession = createUvProSession()
     }
+
+    private fun createUvProSession() = UvProSession(applicationContext, object : UvProSession.Listener {
+        override fun onRxAudio(samples: ShortArray, sampleRateHz: Int) {
+            engine?.submitAudioRaw(samples, samples.size, sampleRateHz, System.nanoTime())
+        }
+
+        override fun onTxTimeout() {
+            mainHandler.post { failTransmitForPtt(txPttGeneration, "UV-Pro transmit timed out; PTT released") }
+        }
+
+        override fun onIoError(message: String) {
+            Log.w(TAG, "UV-Pro I/O error: $message")
+            uvproConnected = false
+            mainHandler.post { broadcastError("UV-Pro Bluetooth link lost") }
+        }
+    })
 
     private fun startEngine(resumeGeneration: Int? = null) {
         val generation = if (resumeGeneration == null) {
@@ -530,7 +549,7 @@ class JS8EngineService : Service() {
                 return
             }
 
-            if (rigControlMode == "trusdx_serial" || rigControlMode == "qmx_serial") {
+            if (rigControlMode == "trusdx_serial" || rigControlMode == "qmx_serial" || rigControlMode == "btech_uvpro") {
                 return
             }
             nextGeneration
@@ -609,6 +628,7 @@ class JS8EngineService : Service() {
 
                 override fun onTxAudio(samples: ShortArray, sampleRateHz: Int) {
                     handleTruSdxTxAudio(samples, sampleRateHz)
+                    handleUvProTxAudio(samples, sampleRateHz)
                 }
             }
 
@@ -617,7 +637,7 @@ class JS8EngineService : Service() {
                 sampleRateHz = 12000,
                 submodes = configuredRxSubmodes(),
                 callbackHandler = callbackHandler,
-                enableTxAudioTap = rigControlMode == "trusdx_serial",
+                enableTxAudioTap = rigControlMode == "trusdx_serial" || rigControlMode == "btech_uvpro",
                 useQmxUsbAudio = rigControlMode == "qmx_serial"
             )
 
@@ -650,6 +670,11 @@ class JS8EngineService : Service() {
                     broadcastProcessTxQueue()
                     startTruSdxRxWorker()
                     scheduleTruSdxRxKeepAlive()
+                } else if (rigControlMode == "btech_uvpro") {
+                    Log.i(TAG, "UV-Pro mode active: skipping microphone capture")
+                    broadcastAudioDevice(UVPRO_AUDIO_NAME)
+                    broadcastEngineState(STATE_RUNNING)
+                    broadcastProcessTxQueue()
                 } else {
                     // Start audio capture with selected device (if any)
                     scoRestartAttempts = 0
@@ -704,6 +729,13 @@ class JS8EngineService : Service() {
                 }
             }.start()
         }
+        if (rigControlMode == "btech_uvpro") {
+            // A fresh session for the next start, so this stop cannot close it.
+            val failedSession = uvProSession
+            uvProSession = createUvProSession()
+            uvproConnected = false
+            Thread { failedSession?.stop() }.start()
+        }
         engineStartInProgress = false
         trusdxInitInProgress = false
         trusdxConnected = false
@@ -738,8 +770,34 @@ class JS8EngineService : Service() {
             "rts_ptt" -> initializeRtsPttControl()
             "trusdx_serial" -> initializeTruSdxControl(generation)
             "qmx_serial" -> initializeQmxControl(generation)
+            "btech_uvpro" -> initializeUvProControl(generation)
             else -> Log.w(TAG, "Unknown rig type: $rigType")
         }
+    }
+
+    private fun initializeUvProControl(generation: Int) {
+        Log.i(TAG, "Initializing UV-Pro Bluetooth audio")
+        uvproConnected = false
+        val session = uvProSession
+        Thread {
+            val opened = try {
+                session?.start() == true
+            } catch (error: Throwable) {
+                Log.e(TAG, "UV-Pro start failed", error)
+                false
+            }
+            mainHandler.post {
+                if (!isCurrentEngineStart(generation)) {
+                    if (opened) session?.stop()
+                } else if (opened) {
+                    uvproConnected = true
+                    rigCtlErrorShown = false
+                    startEngine(generation)
+                } else {
+                    failEngineStart(generation, session?.getLastError() ?: "Failed to connect to the UV-Pro.")
+                }
+            }
+        }.start()
     }
 
     private fun initializeTruSdxControl(generation: Int) {
@@ -1564,6 +1622,7 @@ class JS8EngineService : Service() {
             val shutdownBluetooth = bluetoothSerialBridge
             val shutdownTruSdx = trusdxSerialSession
             val shutdownQmx = qmxCatSession
+            val shutdownUvPro = uvProSession
             val shutdownNetwork = rigCtlClient
             val shouldReleasePtt = isRigControlConnected()
 
@@ -1580,6 +1639,7 @@ class JS8EngineService : Service() {
             rtsPttConnected = false
             trusdxConnected = false
             qmxConnected = false
+            uvproConnected = false
             trusdxWatchdogToken++
             trusdxTxIntentActive = false
             stopTruSdxRxWorker()
@@ -1611,6 +1671,7 @@ class JS8EngineService : Service() {
                         }
                         "trusdx_serial" -> shutdownTruSdx?.setPtt(false) == true
                         "qmx_serial" -> shutdownQmx?.setPtt(false) == true
+                        "btech_uvpro" -> shutdownUvPro?.setPtt(false) == true
                         else -> false
                     }
                     if (released) {
@@ -1622,6 +1683,7 @@ class JS8EngineService : Service() {
                 shutdownHamlib?.close()
                 shutdownTruSdx?.stop()
                 shutdownQmx?.stop()
+                shutdownUvPro?.stop()
                 shutdownUsb?.close()
                 shutdownBluetooth?.close()
                 shutdownNetwork?.disconnect()
@@ -1965,6 +2027,10 @@ class JS8EngineService : Service() {
                 broadcastAudioDevice(label)
                 return
             }
+            if (rigControlMode == "btech_uvpro") {
+                broadcastAudioDevice(UVPRO_AUDIO_NAME)
+                return
+            }
 
             scoRestartAttempts = 0
             scoSourceIndex = 0
@@ -2249,6 +2315,16 @@ class JS8EngineService : Service() {
         if (isTruSdxDiagnosticsEnabled() && (trusdxTxFrames % 200L == 0L)) {
             Log.i(TAG, "TruSDX TX frame #$trusdxTxFrames inRate=$sampleRateHz outSamples=${txSamples.size} inRms=${"%.1f".format(Locale.US, inRms)} silentFrames=$trusdxTxSilentFrames drops=$trusdxTxDrops")
         }
+    }
+
+    private fun handleUvProTxAudio(samplesPcm16: ShortArray, sampleRateHz: Int) {
+        if (rigControlMode != "btech_uvpro" || samplesPcm16.isEmpty()) return
+        val txSamples = if (sampleRateHz == UvProSession.SAMPLE_RATE_HZ) {
+            samplesPcm16
+        } else {
+            resamplePcmLinear(samplesPcm16, sampleRateHz, UvProSession.SAMPLE_RATE_HZ)
+        }
+        uvProSession?.sendTxAudio(txSamples)
     }
 
     private fun resamplePcmLinear(samples: ShortArray, inputRateHz: Int, outputRateHz: Int): ShortArray {
@@ -2709,6 +2785,10 @@ class JS8EngineService : Service() {
         if (rigControlMode == "qmx_serial") {
             Log.d(TAG, "Setting transmit mode for QMX: Digi")
             return qmxCatSession?.setDigiMode() == true
+        }
+        if (rigControlMode == "btech_uvpro") {
+            // FM only; there is no mode to set.
+            return true
         }
         val txMode = prefs.getString(PREF_TRANSMIT_MODE, "none") ?: "none"
         
@@ -3954,6 +4034,7 @@ class JS8EngineService : Service() {
             "rts_ptt" -> rtsPttConnected
             "trusdx_serial" -> trusdxConnected
             "qmx_serial" -> qmxConnected
+            "btech_uvpro" -> uvproConnected
             else -> false
         }
     }
@@ -3971,6 +4052,7 @@ class JS8EngineService : Service() {
             "rts_ptt" -> setRtsPtt(enabled)
             "trusdx_serial" -> trusdxSerialSession?.setPtt(enabled) == true
             "qmx_serial" -> qmxCatSession?.setPtt(enabled) == true
+            "btech_uvpro" -> uvProSession?.setPtt(enabled) == true
             else -> false
         }
     }
@@ -4008,6 +4090,7 @@ class JS8EngineService : Service() {
                 "rts_ptt" -> false
                 "trusdx_serial" -> trusdxSerialSession?.setFrequency(frequencyHz) == true
                 "qmx_serial" -> qmxCatSession?.setFrequency(frequencyHz) == true
+                "btech_uvpro" -> false
                 else -> false
             }
 
@@ -4020,6 +4103,7 @@ class JS8EngineService : Service() {
                         "rts_ptt" -> "RTS PTT does not support frequency control"
                         "trusdx_serial" -> "TruSDX serial CAT command failed"
                         "qmx_serial" -> "QMX CAT command failed"
+                        "btech_uvpro" -> "UV-Pro frequency is set on the radio"
                         else -> ""
                     }
                     if (detail.isNotBlank()) {
@@ -4027,7 +4111,7 @@ class JS8EngineService : Service() {
                     } else {
                         Log.w(TAG, "Failed to set frequency to $frequencyHz Hz")
                     }
-                    if (!rigCtlErrorShown && rigControlMode != "rts_ptt") {
+                    if (!rigCtlErrorShown && rigControlMode != "rts_ptt" && rigControlMode != "btech_uvpro") {
                         if (detail.isNotBlank()) {
                             broadcastError("Rig control failed: $detail")
                         } else {
@@ -4165,6 +4249,8 @@ class JS8EngineService : Service() {
         const val TRUSDX_AUDIO_SPEAKER_ID = -2002
         const val TRUSDX_AUDIO_SERIAL_NAME = "TruSDX Serial"
         const val TRUSDX_AUDIO_SPEAKER_NAME = "TruSDX Speaker"
+        const val UVPRO_AUDIO_ID = -2003
+        const val UVPRO_AUDIO_NAME = "UV-Pro Bluetooth"
         private const val TRUSDX_RX_FRAME_QUEUE_MAX = 512
         private const val TRUSDX_RX_WATCHDOG_INTERVAL_MS = 1200L
         private const val TRUSDX_RX_STALL_REARM_NS = 2_000_000_000L
